@@ -1,0 +1,28 @@
+# ---- Secrets ----
+.env
+.env.local
+.env.*.local
+.env.hardhat
+!.env.example
+
+# ---- Dependencies ----
+node_modules/
+
+# ---- Build output ----
+dist/
+build/
+
+# ---- Hardhat ----
+backend/hardhat-deploy/artifacts/
+backend/hardhat-deploy/cache/
+
+# ---- Large regenerable artifacts ----
+# Tesseract language pack, auto-downloaded on first OCR run
+backend/eng.traineddata
+# Powers of Tau ceremony file, downloaded by circuits/setup_circuit.sh
+backend/circuits/*.ptau
+
+# ---- Logs / OS ----
+*.log
+npm-debug.log*
+.DS_Store
