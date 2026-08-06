@@ -22,6 +22,23 @@ backend/eng.traineddata
 # Powers of Tau ceremony file, downloaded by circuits/setup_circuit.sh
 backend/circuits/*.ptau
 
+# ---- Experiments ----
+# Deny-by-default. experiments/rsa-baseline/ holds ~800MB of regenerable binaries
+# (ptau, zkeys, r1cs, sym, witness, wasm) that must never be committed -- several
+# exceed GitHub's 100MB per-file limit on their own. Only the small source files
+# needed to reproduce the baseline are carved back in below.
+# To track a new source file here, add an explicit negation; anything not listed
+# stays ignored no matter what lands in the directory.
+experiments/*
+!experiments/rsa-baseline/
+experiments/rsa-baseline/*
+!experiments/rsa-baseline/README.md
+!experiments/rsa-baseline/package.json
+!experiments/rsa-baseline/package-lock.json
+!experiments/rsa-baseline/gen_input.js
+!experiments/rsa-baseline/circuits/
+!experiments/rsa-baseline/vectors/
+
 # ---- Mock issuer key material ----
 # NOT ignored, deliberately. mock-issuer/*.pem is throwaway mock signing material
 # with no real-world value; tracking it lets anyone cloning the repo re-sign
