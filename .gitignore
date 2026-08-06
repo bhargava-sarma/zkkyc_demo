@@ -22,6 +22,13 @@ backend/eng.traineddata
 # Powers of Tau ceremony file, downloaded by circuits/setup_circuit.sh
 backend/circuits/*.ptau
 
+# ---- Mock issuer key material ----
+# NOT ignored, deliberately. mock-issuer/*.pem is throwaway mock signing material
+# with no real-world value; tracking it lets anyone cloning the repo re-sign
+# credentials and reproduce the ZK circuit inputs exactly. See mock-issuer/README.md.
+# If a secret scanner objects, uncomment the line below and regenerate per that README.
+# mock-issuer/mock_issuer_private.pem
+
 # ---- Logs / OS ----
 *.log
 npm-debug.log*
