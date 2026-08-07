@@ -38,6 +38,11 @@ experiments/rsa-baseline/*
 !experiments/rsa-baseline/gen_input.js
 !experiments/rsa-baseline/circuits/
 !experiments/rsa-baseline/vectors/
+!experiments/rsa-mock-issuer/
+experiments/rsa-mock-issuer/*
+!experiments/rsa-mock-issuer/README.md
+!experiments/rsa-mock-issuer/precheck_rsa.js
+!experiments/rsa-mock-issuer/gen_input_mock_issuer.js
 
 # ---- Mock issuer key material ----
 # NOT ignored, deliberately. mock-issuer/*.pem is throwaway mock signing material
