@@ -26,10 +26,17 @@ const path = require('path');
 
 const REQUIRED_FIELDS = ['dob', 'gender', 'id_number', 'name'];
 
-// RSA-2048 -> 256-byte signature and 256-byte modulus. Split into 64-bit limbs
-// for Circom bigint arithmetic: 256 bytes / 8 bytes-per-limb = 32 limbs.
-const LIMB_BITS = 64;
-const LIMB_COUNT = 32;
+// RSA-2048 -> 256-byte signature and 256-byte modulus, split into limbs for
+// Circom bigint arithmetic. 121 x 17 = 2057 bits, matching RSAVerifier65537(121, 17)
+// from @zk-email/circuits.
+//
+// Why 121 and not 64: a limb must stay under half the ~254-bit circom field so that
+// limb products cannot overflow, and 17 is the fewest 121-bit limbs that clear 2048.
+// Fewer, wider limbs means far fewer cross-limb multiplications in the modular
+// exponentiation -- measured at 190,945 constraints for 121x17 against the ~536k
+// that a 64x32 layout costs. See experiments/rsa-baseline/.
+const LIMB_BITS = 121;
+const LIMB_COUNT = 17;
 
 const PAYLOAD_PATH = path.join(__dirname, 'payload.json');
 const PRIVATE_KEY_PATH = path.join(__dirname, 'mock_issuer_private.pem');
@@ -154,10 +161,11 @@ function bufferToBigInt(buf) {
  * Splits a BigInt into fixed-width limbs, least-significant limb first.
  *
  * This is the layout the common Circom bigint templates expect (zk-email's
- * RSAVerify65537, circom-rsa-verify): an array of k limbs of n bits each, with
- * index 0 holding the low-order bits. Values are emitted as decimal strings
- * because a 64-bit limb exceeds Number.MAX_SAFE_INTEGER and would lose precision
- * as a JSON number.
+ * RSAVerifier65537, circom-rsa-verify): an array of k limbs of n bits each, with
+ * index 0 holding the low-order bits. Byte-identical to what zk-email's own
+ * bigIntToChunkedBytes helper produces for the same value. Values are emitted as
+ * decimal strings because a 121-bit limb exceeds Number.MAX_SAFE_INTEGER and would
+ * lose precision as a JSON number.
  *
  * @param {bigint} value The value to split
  * @param {number} limbBits Bits per limb
@@ -176,6 +184,26 @@ function toLimbs(value, limbBits, limbCount) {
     throw new Error(`Value does not fit in ${limbCount} limbs of ${limbBits} bits.`);
   }
   return limbs;
+}
+
+// =============================================================================
+// Output
+// =============================================================================
+
+/**
+ * Writes a file by way of a temp file plus a rename.
+ *
+ * rename(2) within a filesystem is atomic, so a reader either sees the whole
+ * previous file or the whole new one - never a half-written JSON document,
+ * even if the process dies mid-write.
+ *
+ * @param {string} filePath Destination path
+ * @param {string} contents Full file contents
+ */
+function writeAtomic(filePath, contents) {
+  const tmpPath = `${filePath}.tmp`;
+  fs.writeFileSync(tmpPath, contents);
+  fs.renameSync(tmpPath, filePath);
 }
 
 // =============================================================================
@@ -222,17 +250,19 @@ function main() {
   const signatureHex = signature.toString('hex');
   console.log(`[SIGN] Signature: ${signature.length} bytes (${signatureHex.substring(0, 32)}...)`);
 
-  // ---- Write signed_credential.json ---------------------------------------
+  // ---- Build signed_credential.json (in memory) ---------------------------
+  // Nothing is written to disk until BOTH documents have been built. The limb
+  // decomposition below can throw - on a bad exponent or a value that does not
+  // fit the limb geometry - and writing the credential before that point would
+  // leave a fresh credential paired with a stale or missing circuit_inputs.json.
   const credential = {
     payload,
     serialized,
     sha256: sha256Hex,
     signature: signatureHex,
   };
-  fs.writeFileSync(CREDENTIAL_PATH, JSON.stringify(credential, null, 2) + '\n');
-  console.log(`[SIGN] Wrote ${path.basename(CREDENTIAL_PATH)}`);
 
-  // ---- Write circuit_inputs.json ------------------------------------------
+  // ---- Build circuit_inputs.json (in memory) ------------------------------
   const publicKey = crypto.createPublicKey(fs.readFileSync(PUBLIC_KEY_PATH, 'utf8'));
   const jwk = publicKey.export({ format: 'jwk' });
   const modulusBytes = Buffer.from(jwk.n, 'base64url');
@@ -277,8 +307,18 @@ function main() {
     // The message the circuit hashes, one byte per array element.
     message_bytes: Array.from(serializedBytes),
   };
-  fs.writeFileSync(CIRCUIT_INPUTS_PATH, JSON.stringify(circuitInputs, null, 2) + '\n');
+  // ---- Commit both to disk ------------------------------------------------
+  // Past this line every value is computed and nothing else can throw, so the
+  // two files cannot diverge. Serializing before either write keeps the window
+  // between them to two rename(2) calls.
+  const credentialJson = JSON.stringify(credential, null, 2) + '\n';
+  const circuitInputsJson = JSON.stringify(circuitInputs, null, 2) + '\n';
+
+  writeAtomic(CREDENTIAL_PATH, credentialJson);
+  console.log(`[SIGN] Wrote ${path.basename(CREDENTIAL_PATH)}`);
+  writeAtomic(CIRCUIT_INPUTS_PATH, circuitInputsJson);
   console.log(`[SIGN] Wrote ${path.basename(CIRCUIT_INPUTS_PATH)}`);
+
   console.log(
     `[SIGN] Circuit sizing: ${circuitInputs.payload_bit_length} message bits, ` +
       `${circuitInputs.sha256_block_count} SHA-256 block(s)`

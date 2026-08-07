@@ -2,17 +2,23 @@
 /**
  * Independent verification of signed_credential.json.
  *
- * This script is deliberately standalone. It reads ONLY signed_credential.json
- * and mock_issuer_public.pem - never the private key, never payload.json, and it
- * imports nothing from sign_credential.js. It also re-implements the canonical
- * serializer inline rather than sharing a helper, so that a mismatch between the
- * documented format and the signing implementation would surface here instead of
- * being hidden by shared code. The duplication is the point.
+ * This script is deliberately standalone. It reads ONLY signed_credential.json,
+ * mock_issuer_public.pem, and (when present) circuit_inputs.json - never the
+ * private key, never payload.json, and it imports nothing from
+ * sign_credential.js. It also re-implements the canonical serializer inline
+ * rather than sharing a helper, so that a mismatch between the documented format
+ * and the signing implementation would surface here instead of being hidden by
+ * shared code. The duplication is the point.
+ *
+ * The credential checks (1-6) need only the credential and the public key, so
+ * they still run for anyone holding just those two files. The limb checks (7-11)
+ * additionally validate circuit_inputs.json and are reported as SKIPPED, not
+ * passed, when that file is absent.
  *
  * Usage:
  *   node verify_credential.js
  *
- * Exits 0 only if every check passes.
+ * Exits 0 only if every check that ran passed.
  */
 
 const crypto = require('crypto');
@@ -21,8 +27,17 @@ const path = require('path');
 
 const CREDENTIAL_PATH = path.join(__dirname, 'signed_credential.json');
 const PUBLIC_KEY_PATH = path.join(__dirname, 'mock_issuer_public.pem');
+const CIRCUIT_INPUTS_PATH = path.join(__dirname, 'circuit_inputs.json');
 
 const REQUIRED_FIELDS = ['dob', 'gender', 'id_number', 'name'];
+
+// Expected limb geometry, matching RSAVerifier65537(121, 17) from
+// @zk-email/circuits. Hardcoded here on purpose: circuit_inputs.json declares its
+// own layout, and this script's job is to catch that declaration drifting from
+// what the circuit actually takes, so it must not read the expectation from the
+// file it is checking.
+const EXPECTED_LIMB_BITS = 121;
+const EXPECTED_LIMB_COUNT = 17;
 
 // =============================================================================
 // Independent re-implementation of the canonical serialization
@@ -45,11 +60,46 @@ function canonicalSerialize(payload) {
   return JSON.stringify(ordered);
 }
 
+/**
+ * Recombines a limb array back into the BigInt it was split from.
+ *
+ * Inverse of sign_credential.js's toLimbs, implemented independently: limbs are
+ * least-significant-first, so this folds from the top down, shifting left by
+ * limbBits per step. Matches zk-email's bigIntToChunkedBytes ordering.
+ *
+ * @param {string[]} limbs Decimal-string limbs, least significant first
+ * @param {number} limbBits Bits per limb
+ * @returns {bigint} The reconstructed value
+ */
+function fromLimbs(limbs, limbBits) {
+  const shift = BigInt(limbBits);
+  let value = 0n;
+  for (let i = limbs.length - 1; i >= 0; i--) {
+    value = (value << shift) + BigInt(limbs[i]);
+  }
+  return value;
+}
+
 // =============================================================================
 // Reporting helpers
 // =============================================================================
 
 let failures = 0;
+let passes = 0;
+let skipped = 0;
+
+/**
+ * Prints a SKIP line. Deliberately distinct from PASS so an absent input file
+ * can never be mistaken for a check that succeeded.
+ *
+ * @param {string} label Human-readable name of the check group
+ * @param {string} reason Why it was skipped
+ */
+function skip(label, reason) {
+  console.log(`[VERIFY] SKIP  ${label}`);
+  console.log(`[VERIFY]       ${reason}`);
+  skipped++;
+}
 
 /**
  * Prints a single pass/fail line and records failures for the exit code.
@@ -64,7 +114,9 @@ function check(passed, label, detail) {
   if (detail) {
     console.log(`[VERIFY]       ${detail}`);
   }
-  if (!passed) {
+  if (passed) {
+    passes++;
+  } else {
     failures++;
   }
   return passed;
@@ -218,11 +270,92 @@ function main() {
     'flipped low bit of the final signature byte'
   );
 
+  // ---- Checks 7-11: circuit_inputs.json limb decomposition ----------------
+  console.log('');
+  console.log('CIRCUIT INPUT CHECKS (circuit_inputs.json)');
+  console.log('-'.repeat(72));
+
+  if (!fs.existsSync(CIRCUIT_INPUTS_PATH)) {
+    skip(
+      'Limb decomposition checks',
+      'circuit_inputs.json not found - run sign_credential.js to generate it'
+    );
+  } else {
+    const ci = JSON.parse(fs.readFileSync(CIRCUIT_INPUTS_PATH, 'utf8'));
+    const layout = ci.limb_layout || {};
+
+    // 7. Geometry matches what RSAVerifier65537(121, 17) consumes. Compared
+    //    against this script's own constants, not against the file's claims.
+    const geometryOk =
+      layout.limb_bits === EXPECTED_LIMB_BITS &&
+      layout.limb_count === EXPECTED_LIMB_COUNT &&
+      Array.isArray(ci.modulus_limbs) &&
+      Array.isArray(ci.signature_limbs) &&
+      ci.modulus_limbs.length === EXPECTED_LIMB_COUNT &&
+      ci.signature_limbs.length === EXPECTED_LIMB_COUNT;
+    check(
+      geometryOk,
+      `Limb geometry is ${EXPECTED_LIMB_COUNT} x ${EXPECTED_LIMB_BITS}-bit, matching RSAVerifier65537(121, 17)`,
+      `declared ${layout.limb_count} x ${layout.limb_bits}-bit; ` +
+        `modulus_limbs=${ci.modulus_limbs?.length}, signature_limbs=${ci.signature_limbs?.length}; ` +
+        `capacity ${EXPECTED_LIMB_COUNT * EXPECTED_LIMB_BITS} bits >= 2048`
+    );
+
+    // 8. Every limb is actually within range. A limb at or above 2^121 would be
+    //    silently wrong: it still reconstructs correctly here, but overflows the
+    //    circuit's Num2Bits(n) range check.
+    const limit = 1n << BigInt(EXPECTED_LIMB_BITS);
+    const allLimbs = [...(ci.modulus_limbs || []), ...(ci.signature_limbs || [])];
+    const oversized = allLimbs.filter((l) => BigInt(l) >= limit).length;
+    check(
+      allLimbs.length > 0 && oversized === 0,
+      `Every limb is < 2^${EXPECTED_LIMB_BITS} (in range for the circuit's Num2Bits check)`,
+      `${allLimbs.length} limbs checked, ${oversized} out of range`
+    );
+
+    // 9. Modulus limbs reconstruct the modulus in the PUBLIC KEY - not the
+    //    modulus_hex sitting next to them in the same file, which would only
+    //    prove the file is self-consistent.
+    const jwk = publicKey.export({ format: 'jwk' });
+    const modulusFromPem = BigInt('0x' + Buffer.from(jwk.n, 'base64url').toString('hex'));
+    const modulusFromLimbs = fromLimbs(ci.modulus_limbs || [], EXPECTED_LIMB_BITS);
+    check(
+      modulusFromLimbs === modulusFromPem,
+      'Modulus limbs recombine to the modulus in mock_issuer_public.pem',
+      `${modulusFromPem.toString(16).length * 4}-bit modulus, reconstructed from ${EXPECTED_LIMB_COUNT} limbs`
+    );
+
+    // 10. Signature limbs reconstruct the signature in the credential.
+    const signatureFromLimbs = fromLimbs(ci.signature_limbs || [], EXPECTED_LIMB_BITS);
+    const signatureFromCredential = BigInt('0x' + credential.signature);
+    check(
+      signatureFromLimbs === signatureFromCredential,
+      'Signature limbs recombine to the signature in signed_credential.json',
+      `${signatureBytes.length * 8}-bit signature, reconstructed from ${EXPECTED_LIMB_COUNT} limbs`
+    );
+
+    // 11. The byte array handed to the circuit is the same message that was
+    //     signed, and the declared lengths match it.
+    const messageBytes = Buffer.from(ci.message_bytes || []);
+    const lengthsOk =
+      ci.payload_byte_length === reserializedBytes.length &&
+      ci.payload_bit_length === reserializedBytes.length * 8;
+    check(
+      Buffer.compare(messageBytes, reserializedBytes) === 0 && lengthsOk,
+      'message_bytes and declared lengths match the serialized payload',
+      `${messageBytes.length} bytes, declared ${ci.payload_byte_length} bytes / ` +
+        `${ci.payload_bit_length} bits, ${ci.sha256_block_count} SHA-256 block(s)`
+    );
+  }
+
   // ---- Verdict ------------------------------------------------------------
   console.log('');
   console.log('='.repeat(72));
   if (failures === 0) {
-    console.log('RESULT: SIGNATURE VALID - all 6 checks passed');
+    console.log(
+      `RESULT: SIGNATURE VALID - all ${passes} checks passed` +
+        (skipped > 0 ? ` (${skipped} skipped)` : '')
+    );
     console.log('='.repeat(72));
     process.exit(0);
   }

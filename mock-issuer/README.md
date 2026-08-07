@@ -29,7 +29,7 @@ given project timeline.
 | `generate_keypair.js` | yes | Generates the RSA-2048 keypair. Refuses to overwrite without `--force`. |
 | `payload.json` | yes | The synthetic identity data, as editable data rather than hardcoded values. |
 | `sign_credential.js` | yes | Serializes → hashes → signs. Writes the two output JSON files. |
-| `verify_credential.js` | yes | Independent verifier. Reads only the credential + public key. |
+| `verify_credential.js` | yes | Independent verifier. Reads only the credential, public key, and circuit inputs. |
 | `mock_issuer_private.pem` | yes | Issuer private key (PKCS#8 PEM, mode 0600). See *Key handling* below. |
 | `mock_issuer_public.pem` | yes | Issuer public key (SPKI PEM). |
 | `signed_credential.json` | yes | *Generated.* Payload, exact serialized bytes, SHA-256, signature. |
@@ -142,7 +142,7 @@ SHA-256 of those bytes:
 | Parameter | Value | Why |
 |---|---|---|
 | Key size | **2048-bit RSA** | Mirrors real-world issuer key sizing. The payload format here is custom, but the key strength is not a toy value. |
-| Public exponent | **65537** | Effectively mandatory: the common Circom RSA templates (zk-email `RSAVerify65537`, `circom-rsa-verify`) hardcode this exponent. `sign_credential.js` throws if the key uses anything else. |
+| Public exponent | **65537** | Effectively mandatory: the common Circom RSA templates (zk-email `RSAVerifier65537`, `circom-rsa-verify`) hardcode this exponent. `sign_credential.js` throws if the key uses anything else. |
 | Hash | **SHA-256** | Circom-friendly (`circomlib/circuits/sha256`). Note this differs from real Aadhaar QR signing, which uses SHA-1 — see the scope note. |
 | Signature scheme | **RSASSA-PKCS1-v1_5** | **No deviation.** The standard scheme that circom RSA-verify templates expect. Not PSS — PSS's salted, randomized encoding is substantially more expensive to verify in-circuit. |
 | Signature size | 256 bytes | 2048 bits. |
@@ -198,11 +198,25 @@ exactly this structure and its trailing 32 bytes equal the stored SHA-256.
 
 Circom bigint arithmetic works on limb arrays. The modulus and signature are each split into:
 
-- **32 limbs of 64 bits** (`32 × 64 = 2048`)
-- **Least-significant limb first** — `limbs[0]` holds the low-order 64 bits. This is the
-  layout zk-email's `RSAVerify65537` and `circom-rsa-verify` expect.
-- **Decimal strings**, not JSON numbers: a 64-bit limb exceeds `Number.MAX_SAFE_INTEGER`
+- **17 limbs of 121 bits** (`17 × 121 = 2057 ≥ 2048`)
+- **Least-significant limb first** — `limbs[0]` holds the low-order 121 bits. This is the
+  layout `RSAVerifier65537(121, 17)` from `@zk-email/circuits` expects, and the output is
+  byte-identical to that library's own `bigIntToChunkedBytes` packer for the same value.
+- **Decimal strings**, not JSON numbers: a 121-bit limb exceeds `Number.MAX_SAFE_INTEGER`
   and would lose precision as a number literal.
+
+**Why 121 × 17 and not 64 × 32.** A limb must stay below half the ~254-bit circom field so
+that limb products cannot overflow, and 17 is the fewest 121-bit limbs that clear 2048.
+Fewer, wider limbs means far fewer cross-limb multiplications in the modular exponentiation:
+measured at **190,945 constraints** for 121 × 17, against the ~536k a 64 × 32 layout costs —
+roughly 2.8× cheaper, and the difference between needing a pot18 ptau and a pot20. The
+baseline that produced those numbers lives in `experiments/rsa-baseline/`.
+
+`toLimbs()` in `sign_credential.js` is parameterized by `LIMB_BITS` / `LIMB_COUNT` and
+throws if a value does not fit the requested geometry, so changing the layout again is a
+two-constant edit that fails loudly rather than silently truncating. Both output documents
+are built in memory before either is written, so a failure there leaves **neither** file
+touched rather than pairing a fresh credential with stale circuit inputs.
 
 `circuit_inputs.json` also carries `message_bytes` (the 83 serialized bytes, one per array
 element), `modulus_hex`, `exponent`, `payload_byte_length`, `payload_bit_length`, and
@@ -215,14 +229,16 @@ Nothing in `circuit_inputs.json` is authoritative — it is a convenience deriva
 
 ## Verification
 
-`verify_credential.js` is deliberately standalone. It reads **only** `signed_credential.json`
-and `mock_issuer_public.pem` — never the private key, never `payload.json`, and it imports
-nothing from `sign_credential.js`. It also **re-implements the canonical serializer inline**
-rather than sharing a helper module, so a mismatch between this documented format and the
-signing implementation would surface as a failure instead of being masked by shared code.
-The duplication is intentional.
+`verify_credential.js` is deliberately standalone. It reads **only** `signed_credential.json`,
+`mock_issuer_public.pem`, and — when present — `circuit_inputs.json`; never the private key,
+never `payload.json`, and it imports nothing from `sign_credential.js`. It also
+**re-implements the canonical serializer inline** rather than sharing a helper module, so a
+mismatch between this documented format and the signing implementation would surface as a
+failure instead of being masked by shared code. The duplication is intentional.
 
-Six checks, each reported separately:
+Eleven checks, each reported separately.
+
+**Credential checks (1–6)** — need only the credential and the public key:
 
 1. Credential structure is well-formed.
 2. Re-serializing `payload` reproduces the stored `serialized` field **byte for byte**
@@ -232,8 +248,21 @@ Six checks, each reported separately:
 5. **Negative control** — a message with one flipped bit is rejected.
 6. **Negative control** — a signature with one flipped bit is rejected.
 
+**Circuit input checks (7–11)** — validate `circuit_inputs.json`:
+
+7. Limb geometry is 17 × 121-bit, checked against constants hardcoded in the verifier rather
+   than against the layout the file declares about itself.
+8. Every limb is `< 2^121`. An oversized limb still recombines correctly but would blow the
+   circuit's `Num2Bits(121)` range check, so this catches a failure the round-trip cannot.
+9. Modulus limbs recombine to the modulus **in `mock_issuer_public.pem`** — not to the
+   `modulus_hex` sitting beside them, which would only prove the file is self-consistent.
+10. Signature limbs recombine to the signature in `signed_credential.json`.
+11. `message_bytes` and the declared byte/bit lengths match the serialized payload.
+
 Checks 5 and 6 exist because a verifier that accepted everything would pass 1–4 just as
-happily. Exit code is 0 only if all six pass.
+happily. If `circuit_inputs.json` is absent, checks 7–11 report **SKIP** — deliberately
+distinct from PASS, so a missing file can never read as a success. Exit code is 0 only if
+every check that ran passed.
 
 ### External cross-check
 

@@ -25,7 +25,7 @@ const path = require('path');
 const KEY_BITS = 2048;
 
 // e = 65537 is not merely Node's default; it is effectively mandatory here.
-// The common Circom RSA templates (zk-email's RSAVerify65537, circom-rsa-verify)
+// The common Circom RSA templates (zk-email's RSAVerifier65537, circom-rsa-verify)
 // hardcode this exponent, so any other value would make Task 2's circuit unusable.
 const PUBLIC_EXPONENT = 65537;
 
